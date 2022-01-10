@@ -1,5 +1,6 @@
 use std::sync::{
     atomic::{AtomicBool, Ordering},
+    mpsc::channel,
     Arc,
 };
 mod protocol;
@@ -63,6 +64,20 @@ fn main() {
     // 读的一端
     let reader_session = session.clone();
 
+    // 写的一端
+    let writer_session = session.clone();
+
+    // 发送结构体
+    struct Resp {
+        data: Vec<u8>,
+        src_ip: [u8; 4],
+        src_port: u16,
+        dst_ip: [u8; 4],
+        dst_port: u16,
+    }
+
+    let (tx, rx) = channel::<Resp>();
+
     // 全局运行标志
     static RUNNING: AtomicBool = AtomicBool::new(true);
 
@@ -74,23 +89,65 @@ fn main() {
                     let bytes = packet.bytes();
 
                     // 解析判断是否ipv4的udp协议（RFC 790）
-                    if protocol::ipv4_version(bytes) == 4 && protocol::ipv4_protocol(bytes) == 17 {
+                    if protocol::ipv4_version(bytes) == 4
+                        && protocol::ipv4_protocol(bytes) == 17
+                        && protocol::ipv4_dst_addr(bytes) == &[10, 28, 13, 100]
+                    {
                         // 打印udp数据
-                        let ipv4 = protocol::ipv4_dst_addr(bytes);
+                        let dstip = protocol::ipv4_dst_addr(bytes);
                         let udp_pack = protocol::ipv4_data(bytes);
                         println!(
                             "dst ip {}.{}.{}.{} port: {} recv: {}",
-                            ipv4[0],
-                            ipv4[1],
-                            ipv4[2],
-                            ipv4[3],
+                            dstip[0],
+                            dstip[1],
+                            dstip[2],
+                            dstip[3],
                             protocol::udp_dst_port(udp_pack),
                             String::from_utf8_lossy(protocol::udp_data(udp_pack))
                         );
+
+                        // 发送响应包
+                        let mut resp_data = "Recv: ".as_bytes().to_vec();
+                        resp_data.extend_from_slice(protocol::udp_data(udp_pack));
+
+                        // 发送/接收方相反
+                        let srcip = protocol::ipv4_src_addr(bytes);
+                        let resp = Resp {
+                            data: resp_data,
+                            src_ip: [dstip[0], dstip[1], dstip[2], dstip[3]],
+                            src_port: protocol::udp_dst_port(udp_pack),
+                            dst_ip: [srcip[0], srcip[1], srcip[2], srcip[3]],
+                            dst_port: protocol::udp_src_port(udp_pack),
+                        };
+                        tx.send(resp).unwrap();
                     }
                 }
                 Err(_) => unreachable!(),
             }
+        }
+    });
+
+    let writer = std::thread::spawn(move || {
+        while RUNNING.load(Ordering::Relaxed) {
+            let resp = rx.recv().unwrap();
+            // 申请发送buffer
+            let mut write_pack = writer_session
+                .allocate_send_packet(28 + resp.data.len() as u16)
+                .unwrap();
+            let mut resp_pack = write_pack.bytes_mut();
+
+            // 构建响应IP包
+            protocol::ipv4_udp_build(
+                &mut resp_pack,
+                &resp.src_ip,
+                resp.src_port,
+                &resp.dst_ip,
+                resp.dst_port,
+                &resp.data,
+            );
+
+            // 发送响应包
+            writer_session.send_packet(write_pack);
         }
     });
 
@@ -101,4 +158,5 @@ fn main() {
     RUNNING.store(false, Ordering::Relaxed);
     session.shutdown();
     let _ = reader.join();
+    let _ = writer.join();
 }
